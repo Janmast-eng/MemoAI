@@ -30,7 +30,7 @@ laun = {'ZHCN':{
             }}
 class Config:
     def __init__(self):
-        self.model_path = 'model/dialog_model.pth'
+        self.model_path = 'model/chat_model.pth'
         self.vocab_path = 'model/vocab.json'
         self.log_dir = 'log'
         self.memory_dir = 'memory'
@@ -1518,7 +1518,7 @@ class App:
     
     def check_ai_model(self):
         """检查AI模型状态"""
-        model_path = "model/dialog_model.pth"
+        model_path = "model/chat_model.pth"
         if os.path.exists(model_path) and os.path.getsize(model_path) > 0:
             return True, "模型文件正常"
         return False, "模型文件缺失或损坏"
