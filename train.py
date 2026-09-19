@@ -1,529 +1,291 @@
-import os, re, math, json, torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Subset
-from safetensors.torch import save_file
-from bitsandbytes.optim import AdamW8bit
-from collections import Counter, OrderedDict
-from tqdm import tqdm
-from pathlib import Path
 
-# ================================================
+from __future__ import annotations
 
-default_config = {
-    "hidden_size": 1024,
-    "ffn_hidden_size": 4096,
-    "block_count": 24,
-    "num_heads": 16,
-    "num_kv_heads": 1,
-    "rope_dim": 64,
-    "rope_base": 10000,
-    "vocab_size": 32000,
-    "max_seq_length": 512,
-    "batch_size": 2,
-    "split_valid": 0.01,
-    "dropout_rate": 0.1,
-    "learning_rate": 1e-4,
-    "learning_gamma": 0.95,
-    "layer_norm_eps": 1e-6,
-    "global_tokens": {
-        "<|padding|>": 0,
-        "<|unknown|>": 1
-    },
-    "special_tokens": {
-        "<|system|>": 2,
-        "<|user|>": 3,
-        "<|think|>": 4,
-        "<|/think|>": 11,
-        "<|assistant|>": 5,
-        "<|function|>": 6,
-        "<|end|>": 7,
-        "\\n": 8,
-        "WaFiGPT": 9,
-        "Miwafi": 10,
-    }
-}
+import argparse
+import math
+import os
+import time
 
-# ================================================
+import numpy as np
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, base=10000):
-        super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-        self.rope_scale = nn.Parameter(torch.ones(1))
+from gpu import RNG, USE_GPU, describe_device
+from model import (
+    AdamW,
+    ASSISTANT_PREFIX,
+    BPETokenizer,
+    CharTokenizer,
+    HUMAN_ROLE,
+    NanoGPT,
+    TURN_SEP,
+    USER_PREFIX,
+    clip_grad_norm,
+    configure_utf8,
+    default_config,
+    dialogs_to_text,
+    encode_dialogs,
+    load_checkpoint,
+    load_corpus,
+    sample_token,
+    save_checkpoint,
+)
 
-    def forward(self, seq_len, offset=0, device=None):
-        pos = torch.arange(offset, offset + seq_len, device=device).type_as(self.inv_freq)
-        freqs = torch.einsum("i,j->ij", pos, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        emb = emb * self.rope_scale
-        cos = emb.cos()[None, :, :]
-        sin = emb.sin()[None, :, :]
-        return cos, sin
-
-def rotate_half(x):
-    x1 = x[..., ::2]
-    x2 = x[..., 1::2]
-    return torch.cat([-x2, x1], dim=-1)
-
-# ================================================
-
-class RMSNorm(nn.Module):
-    def __init__(self, d, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d))
-
-    def forward(self, x):
-        norm = x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
-        return self.weight * (x / norm)
-
-# ================================================
-
-class SelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.hidden_size = config["hidden_size"]
-        self.num_heads = config["num_heads"]
-        self.num_kv_heads = config["num_kv_heads"]
-        self.rope_dim = config["rope_dim"]
-        self.dropout = nn.Dropout(config["dropout_rate"])
-        self.head_dim = self.hidden_size // self.num_heads
-        self.rope = RotaryEmbedding(config["rope_dim"], base=config["rope_base"])
-
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-
-    def forward(self, x, mask=None, pos_offset=0):
-        B, T, C = x.shape
-        device = x.device
-
-        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        if self.num_kv_heads == 1:
-            k = k.repeat(1, self.num_heads, 1, 1)
-            v = v.repeat(1, self.num_heads, 1, 1)
-        elif self.num_kv_heads < self.num_heads:
-            repeat = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(repeat, dim=1)
-            v = v.repeat_interleave(repeat, dim=1)
-
-        rope_dim = min(self.rope_dim, self.head_dim)
-        if rope_dim > 0:
-            cos, sin = self.rope(T, pos_offset, device)
-            cos = cos.squeeze(0).unsqueeze(0)
-            sin = sin.squeeze(0).unsqueeze(0)
-            q1, q2 = q[..., :rope_dim], q[..., rope_dim:]
-            k1, k2 = k[..., :rope_dim], k[..., rope_dim:]
-            q1 = q1 * cos + rotate_half(q1) * sin
-            k1 = k1 * cos + rotate_half(k1) * sin
-            q = torch.cat([q1, q2], dim=-1)
-            k = torch.cat([k1, k2], dim=-1)
-
-        scale = self.head_dim ** -0.5
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-
-        if mask is not None:
-            attn_scores = attn_scores.masked_fill(mask, torch.finfo(attn_scores.dtype).min)
-
-        attn_probs = torch.softmax(attn_scores, dim=-1)
-        attn_probs = self.dropout(attn_probs)
-        out = torch.matmul(attn_probs, v).transpose(1, 2).reshape(B, T, -1)
-        return self.o_proj(out)
-
-# ================================================
-
-class FeedForward(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.hidden_size = config["hidden_size"]
-        self.ffn_hidden_size = config["ffn_hidden_size"]
-        self.in_proj = nn.Linear(self.hidden_size, self.ffn_hidden_size * 2, bias=False)
-        self.up_proj = nn.Linear(self.ffn_hidden_size, self.hidden_size, bias=False)
-        self.dropout = nn.Dropout(config["dropout_rate"])
-
-    def forward(self, x):
-        x_proj = self.in_proj(x)
-        x1, x2 = x_proj.chunk(2, dim=-1)
-        x = F.silu(x1) * x2
-        x = self.up_proj(x)
-        return self.dropout(x)
-
-# ================================================
-
-class TransformerBlock(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.attn_norm = RMSNorm(config["hidden_size"], eps=config["layer_norm_eps"])
-        self.attn = SelfAttention(config)
-        self.ffn_norm = RMSNorm(config["hidden_size"], eps=config["layer_norm_eps"])
-        self.ffn = FeedForward(config)
-        self.dropout = nn.Dropout(config["dropout_rate"])
-
-    def forward(self, x, mask=None, pos_offset=0):
-        residual = x
-        x = self.attn_norm(x)
-        x = residual + self.dropout(self.attn(x, mask=mask, pos_offset=pos_offset))
-
-        residual = x
-        x = self.ffn_norm(x)
-        x = residual + self.dropout(self.ffn(x))
-        return x
-
-# ================================================
-
-class ChatModel(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.embed = nn.Embedding(config["vocab_size"], config["hidden_size"])
-        self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config["block_count"])])
-        self.norm = RMSNorm(config["hidden_size"], eps=config["layer_norm_eps"])
-        self.head = nn.Linear(config["hidden_size"], config["vocab_size"], bias=False)
-
-    def get_mask(self, T, device):
-        i = torch.arange(T, device=device).unsqueeze(1)
-        j = torch.arange(T, device=device).unsqueeze(0)
-        mask = (j > i).unsqueeze(0).unsqueeze(1)
-        return mask
-
-    def forward(self, input_ids, attention_mask=None, labels=None, pos_offset=0):
-        B, T = input_ids.shape
-        device = input_ids.device
-        x = self.embed(input_ids)
-        mask = self.get_mask(T, device)
-
-        if attention_mask is not None:
-            pad_mask = (attention_mask == 0).view(B, 1, 1, T)
-            mask = mask | pad_mask
-
-        for blk in self.blocks:
-            x = blk(x, mask=mask, pos_offset=pos_offset)
-
-        x = self.norm(x)
-        logits = self.head(x)
-        loss = None
-
-        if labels is not None:
-            loss = F.cross_entropy(logits.view(-1, self.config["vocab_size"]),
-                labels.view(-1), ignore_index=self.config["global_tokens"]["<|padding|>"])
-        return {"loss": loss, "logits": logits}
-
-# ================================================
-
-class ChatTokenizer:
-    def __init__(self, config):
-        self.config = config
-        self.split_tokens = OrderedDict()
-        for t, idx in config["global_tokens"].items():
-            self.split_tokens[t] = idx
-        for t, idx in config["special_tokens"].items():
-            self.split_tokens[t] = idx
-
-        toks = sorted(self.split_tokens.keys(), key=lambda x: len(x), reverse=True)
-        self.pattern = re.compile(rf"({'|'.join(map(re.escape, toks))})|([a-zA-Z]+)|( )|([0-9])|(_)|([^\s])", re.UNICODE)
-
-    def tokenize(self, text):
-        return [m.group() for m in self.pattern.finditer(text)]
-
-    def convert_tokens_to_ids(self, tokens, update=True):
-        unk = self.split_tokens["<|unknown|>"]
-        ids = []
-        for t in tokens:
-            if update and t not in self.split_tokens:
-                if len(self.split_tokens) < self.config["vocab_size"]:
-                    self.split_tokens[t] = len(self.split_tokens)
-                else:
-                    ids.append(unk)
-                    continue
-            ids.append(self.split_tokens.get(t, unk))
-        return ids
-
-    def __call__(self, text, max_len=None, trunc=True, update=False):
-        toks = self.tokenize(text)
-        ids = self.convert_tokens_to_ids(toks, update)
-
-        if trunc and max_len:
-            ids = ids[:max_len]
-        if max_len:
-            pad_id = self.split_tokens["<|padding|>"]
-            ids = ids + [pad_id] * (max_len - len(ids))
-
-        mask = [1 if i != self.split_tokens["<|padding|>"] else 0 for i in ids]
-        return {"input_ids": torch.tensor(ids, dtype=torch.long), "attention_mask": torch.tensor(mask, dtype=torch.long)}
-
-    def build_split_tokens(self, stages, min_freq=1):
-        freq = Counter()
-        for i, stage in enumerate(stages):
-            path = stage["file_path"]
-            with open(path, encoding="utf-8") as f:
-                total_lines = sum(1 for _ in f)
-                f.seek(0)
-                for line in tqdm(f, desc=f"[Tokenize {i+1:02d}]", total=total_lines):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    for tok in self.tokenize(line):
-                        if tok not in self.config["special_tokens"] and tok not in self.config["global_tokens"]:
-                            freq[tok] += 1
-
-        new_tokens = [t for t, c in freq.most_common() if c >= min_freq]
-        avail = self.config["vocab_size"] - len(self.split_tokens)
-        for t in new_tokens[:avail]:
-            self.split_tokens[t] = len(self.split_tokens)
-
-    def get_split_tokens(self):
-        return self.split_tokens
-
-    def decode(self, ids):
-        inv = {idx: t for t, idx in self.split_tokens.items()}
-        return ''.join(inv.get(i, "<|unknown|>") for i in ids)
-
-# ================================================
-
-def find_training_files(data_dir="./data"):
-    data_path = Path(data_dir)
-    if not data_path.exists():
-        raise FileNotFoundError(f"Data directory not found: {data_dir}")
-    
-    supported_extensions = {".txt", ".jsonl"}
-    files = []
-    for f in data_path.iterdir():
-        if f.is_file() and f.suffix.lower() in supported_extensions:
-            files.append(str(f))
-    
-    if not files:
-        raise FileNotFoundError(f"No training files found in {data_dir}")
-    
-    print(f"Found {len(files)} training files:")
-    for f in files:
-        print(f"  - {f}")
-    return files
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DATA = os.path.join(HERE, "data")
 
 
-class ChatDataset(Dataset):
-    def __init__(self, tokenizer, path, config):
-        self.tokenizer = tokenizer
-        self.max_len = config["max_seq_length"] + 1
-        self.path = path
-        self.file_ext = Path(path).suffix.lower()
-        self.offsets = []
-        
-        if self.file_ext == ".jsonl":
-            self._load_jsonl_offsets()
-        elif self.file_ext == ".txt":
-            self._load_txt_offsets()
+def get_batch(data: np.ndarray, block_size: int, batch_size: int, rng: np.random.Generator):
+    ix = rng.integers(0, len(data) - block_size - 1, size=(batch_size,))
+    off = ix[:, None] + np.arange(block_size)[None, :]
+    return data[off], data[off + 1]
+
+
+def estimate_loss(model: NanoGPT, splits: dict, block_size: int, batch_size: int,
+                  iters: int, rng: np.random.Generator) -> dict:
+    out = {}
+    for name, data in splits.items():
+        if len(data) <= block_size + 1:
+            out[name] = float("nan")
+            continue
+        tot = 0.0
+        for _ in range(iters):
+            x, y = get_batch(data, block_size, batch_size, rng)
+            _, loss = model.forward(x, targets=y)
+            tot += loss
+        out[name] = tot / iters
+    return out
+
+
+def generate_sample(model: NanoGPT, tok, prompt: str, rng: np.random.Generator,
+                    max_new: int = 120, temperature: float = 0.8, top_p: float = 0.95) -> str:
+    block = model.c["block_size"]
+    ids = tok.encode(prompt) or [tok.unk_id]
+    for _ in range(max_new):
+        ctx = np.array([ids[-block:]], dtype=np.int64)
+        logits, _ = model.forward(ctx)
+        nxt = sample_token(logits[0, -1], rng, temperature=temperature, top_p=top_p)
+        ids.append(nxt)
+        if tok.itos[nxt] == tok.EOS:
+            break
+    return tok.decode(ids)
+
+
+def print_progress(epoch: int, n_epochs: int, step: int, total: int,
+                   loss: float, val_loss: float | None, lr: float, gnorm: float,
+                   elapsed: float, global_step: int, total_steps: int,
+                   width: int = 20) -> None:
+    """单行原地刷新的训练进度条（纯字符实现，无第三方依赖）。"""
+    filled = int(width * step / max(1, total))
+    bar = "█" * filled + "-" * (width - filled)
+    speed = elapsed / max(1, global_step)
+    eta = speed * max(0, total_steps - global_step)
+    val_s = f" | val {val_loss:.4f}" if val_loss is not None else ""
+    msg = (f"epoch {epoch}/{n_epochs} |{bar}| {step}/{total}"
+           f" | loss {loss:.4f}{val_s} | lr {lr:.2e} | g {gnorm:.2f}"
+           f" | {speed:.2f}s/it | 剩余 {eta / 60:.1f} 分钟")
+    print("\r" + msg.ljust(110), end="", flush=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="纯 NumPy 训练的 nano 自回归语言模型")
+    p.add_argument("--data", default=DEFAULT_DATA,
+                   help="数据集：单个 .jsonl 文件，或包含 .jsonl 的目录（只读取 jsonl 对话数据）")
+    p.add_argument("--model-dir", default=os.path.join(HERE, "model"), help="模型保存目录")
+    # 训练
+    p.add_argument("--epochs", type=int, default=10, help="训练轮数，每轮结束保存一次")
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--block-size", type=int, default=128, help="上下文长度")
+    p.add_argument("--steps-per-epoch", type=int, default=0, help="每轮 step 数，0=自动（遍历一遍训练集）")
+    p.add_argument("--lr", type=float, default=3e-3)
+    p.add_argument("--min-lr-ratio", type=float, default=0.1, help="余弦退火终点学习率 = lr * ratio")
+    p.add_argument("--warmup", type=int, default=100, help="warmup step 数")
+    p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--eval-every", type=int, default=100, help="每 N step 打印一次验证 loss")
+    p.add_argument("--eval-iters", type=int, default=5)
+    # 模型
+    p.add_argument("--n-layer", type=int, default=4)
+    p.add_argument("--n-head", type=int, default=4)
+    p.add_argument("--n-embd", type=int, default=128)
+    # 分词
+    p.add_argument("--tokenizer", choices=("bpe", "char"), default="bpe",
+                   help="分词器：bpe=NumPy 实现的子词分词器（默认），char=字符级（旧版行为）")
+    p.add_argument("--vocab-size", type=int, default=2048,
+                   help="BPE 目标词表大小（含 4 个特殊 token）")
+    p.add_argument("--bpe-chars", type=int, default=0,
+                   help="训练 BPE 时使用的语料字符数上限，0=全部（默认）")
+    p.add_argument("--min-pair-freq", type=int, default=2,
+                   help="BPE：pair 出现次数低于该值就停止合并")
+    p.add_argument("--max-vocab", type=int, default=0, help="char 分词器的词表上限，0=不限制（默认）")
+    # 数据
+    p.add_argument("--val-ratio", type=float, default=0.1)
+    # 其它
+    p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--resume", action="store_true", help="从 model/ 最新 checkpoint 继续训练")
+    # 设备
+    p.add_argument("--gpu", action="store_true", help="要求使用 NVIDIA GPU（需安装 CuPy，默认自动检测）")
+    p.add_argument("--cpu", action="store_true", help="强制使用 CPU")
+    return p
+
+def main():
+    configure_utf8()
+    args = build_parser().parse_args()
+    if args.gpu and not USE_GPU:
+        raise SystemExit("[error] --gpu 未检测到可用 NVIDIA GPU："
+                         "请安装 CuPy（CUDA 12.x: pip install cupy-cuda12x；CUDA 11.x: pip install cupy-cuda11x）")
+    print(f"[device] {describe_device()}")
+    rng = RNG(args.seed)
+    os.makedirs(args.model_dir, exist_ok=True)
+
+    print(f"[data] 读取 jsonl 数据集: {args.data}")
+    try:
+        dialogs, files, bad_lines = load_corpus(args.data)
+    except FileNotFoundError as e:
+        raise SystemExit(f"[error] {e}\n[error] 请把 .jsonl 对话数据放到 {args.data} 后重试")
+    n_turns = sum(len(d) for d in dialogs)
+    corpus = dialogs_to_text(dialogs)
+    print(f"[data] 文件 {len(files)} 个 | 对话 {len(dialogs):,} 段 | 轮次 {n_turns:,} "
+          f"| 字符 {len(corpus):,}" + (f" | 跳过无效行 {bad_lines:,}" if bad_lines else ""))
+
+    model = tok = opt = None
+    start_epoch, global_step = 1, 0
+    if args.resume:
+        try:
+            model, tok, meta_prev, _, opt = load_checkpoint(args.model_dir)
+            start_epoch = int(meta_prev.get("epoch", 0)) + 1
+            global_step = int(meta_prev.get("step", 0))
+            print(f"[resume] 从 epoch {start_epoch - 1} 继续，已训练 {global_step} steps")
+        except FileNotFoundError as e:
+            print(f"[resume] 无可恢复的 checkpoint（{e}），改为从头训练")
+
+    if model is None:
+        if args.tokenizer == "bpe":
+            sample_n = args.bpe_chars if args.bpe_chars > 0 else None
+            print(f"[token] 训练 BPE 分词器（目标词表 {args.vocab_size}，"
+                  f"语料采样 {sample_n or len(corpus):,} 字符）")
+            tok = BPETokenizer.train(corpus, vocab_size=args.vocab_size,
+                                     min_pair_freq=args.min_pair_freq,
+                                     max_chars=sample_n)
         else:
-            raise ValueError(f"Unsupported file format: {self.file_ext}")
-        
-        self.length = len(self.offsets)
+            tok = CharTokenizer(corpus, max_vocab=args.max_vocab)
+            print(f"[token] 字符级分词器，词表 {len(tok.itos):,}")
+        probe = corpus[:5000]
+        if tok.decode(tok.encode(probe)) != probe:
+            print("[warn] encode/decode 未能无损还原文段，请检查分词器实现")
+        cfg = default_config(len(tok.itos))
+        cfg.update(n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
+                   block_size=args.block_size)
+        model = NanoGPT(cfg, seed=args.seed)
+        opt = AdamW(model.state_dict(), lr=args.lr, weight_decay=args.weight_decay)
 
-    def _load_txt_offsets(self):
-        with open(self.path, "rb") as f:
-            offset = 0
-            for line in f:
-                if line.strip():
-                    self.offsets.append(offset)
-                offset += len(line)
+    ids = np.array(encode_dialogs(tok, dialogs), dtype=np.int32)
+    if len(ids) < 4 * (args.block_size + 2):
+        print(f"[warn] 语料仅 {len(ids):,} token，建议准备更大的数据集")
+    block = min(args.block_size, max(8, (len(ids) - 2) // 4))
+    if block != args.block_size:
+        model.c["block_size"] = block
+        print(f"[data] 语料偏小，上下文长度调整为 {block}")
 
-    def _load_jsonl_offsets(self):
-        with open(self.path, "r", encoding="utf-8") as f:
-            offset = 0
-            for line in f:
-                if line.strip():
-                    self.offsets.append(offset)
-                offset += len(line.encode("utf-8"))
+    n_val = max(block + 2, int(len(ids) * args.val_ratio))
+    n_val = min(n_val, len(ids) - block - 2)
+    n_val = max(n_val, 1)
+    train_ids, val_ids = ids[: len(ids) - n_val], ids[len(ids) - n_val:]
 
-    def __len__(self):
-        return self.length
+    ratio = len(corpus) / max(1, len(ids))
+    print(f"[token] {type(tok).__name__} 词表 {len(tok.itos):,} | 压缩率 {ratio:.2f} 字符/token "
+          f"| 训练 {len(train_ids):,} token | 验证 {len(val_ids):,} token")
+    print(f"[model] layer={model.c['n_layer']} head={model.c['n_head']} embd={model.c['n_embd']} "
+          f"ctx={model.c['block_size']} | 参数量 {model.n_params():,}")
 
-    def __getitem__(self, idx):
-        offset = self.offsets[idx]
-        
-        if self.file_ext == ".jsonl":
-            with open(self.path, "r", encoding="utf-8") as f:
-                f.seek(offset)
-                line = f.readline().strip()
-            try:
-                data = json.loads(line)
-                text = ""
-                if "instruction" in data:
-                    text = data.get("instruction", "")
-                    if "input" in data and data["input"]:
-                        text += "\n" + data["input"]
-                    if "output" in data and data["output"]:
-                        output_text = data["output"]
-                        text += "\n" + output_text
-                elif "text" in data:
-                    text = data["text"]
-                else:
-                    text = line
-            except json.JSONDecodeError:
-                text = line
-        else:
-            with open(self.path, "rb") as f:
-                f.seek(offset)
-                line = f.readline().decode("utf-8", errors="replace").strip()
-            text = line
-        
-        enc = self.tokenizer(text, self.max_len, update=False)
-        ids = enc["input_ids"]
-        return {"input_ids": ids[:-1], "attention_mask": enc["attention_mask"][:-1], "labels": ids[1:]}
+    if len(train_ids) <= block + 1:
+        raise SystemExit(f"[error] 训练 token 太少（{len(train_ids)}），无法组成 batch，请增加数据")
 
-# ================================================
+    auto_steps = max(1, len(train_ids) // (args.batch_size * block))
+    steps_per_epoch = args.steps_per_epoch if args.steps_per_epoch > 0 else auto_steps
+    n_epochs = max(1, args.epochs - start_epoch + 1)
+    total_steps = max(1, steps_per_epoch * n_epochs)
+    lr_min = args.lr * args.min_lr_ratio
+    warmup = max(1, min(args.warmup, max(1, total_steps // 10)))
 
-class CustomLRScheduler:
-    def __init__(self, optimizer, config):
-        self.optimizer = optimizer
-        self.base_lr = config["learning_rate"]
-        self.gamma = config["learning_gamma"]
+    def lr_at(step: int) -> float:
+        if step < warmup:
+            return args.lr * (step + 1) / warmup
+        prog = min(1.0, max(0.0, (step - warmup) / max(1, total_steps - warmup)))
+        return lr_min + 0.5 * (args.lr - lr_min) * (1.0 + math.cos(math.pi * prog))
 
-    def step(self, epoch):
-        new_lr = self.base_lr * (self.gamma ** epoch)
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = new_lr
+    def sample_prompt() -> str:
+        """取一条验证集对话的首个用户提问，拼成和训练一致的 prompt 用于抽样展示。"""
+        for turns in dialogs[-20:]:
+            for role, text in turns:
+                if role == HUMAN_ROLE:
+                    return f"{USER_PREFIX} {text[:80]}{TURN_SEP}{ASSISTANT_PREFIX}"
+        return f"{USER_PREFIX} 你好{TURN_SEP}{ASSISTANT_PREFIX}"
 
-# ================================================
+    splits = {"train": train_ids, "val": val_ids}
+    print(f"[train] 每 epoch {steps_per_epoch} steps，共 {n_epochs} 个 epoch，"
+          f"batch={args.batch_size} x {block}")
+    print("-" * 60)
 
-def get_gpu_stats():
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated(0) / 1024**2
-        reserved = torch.cuda.memory_reserved(0) / 1024**2
-        return f"GPU Mem: {allocated:.0f}MB/{reserved:.0f}MB"
-    return ""
+    t0 = time.time()
+    for epoch in range(start_epoch, args.epochs + 1):
+        ep_loss, ep_n, smooth = 0.0, 0, None
+        last_val = None
+        for s in range(steps_per_epoch):
+            opt.lr = lr_at(global_step)
+            x, y = get_batch(train_ids, block, args.batch_size, rng)
+            _, loss = model.forward(x, targets=y)
+            grads = model.backward()
+            gnorm = clip_grad_norm(grads, args.grad_clip)
+            opt.step(model.state_dict(), grads)
 
-def run_epoch(model, data_loader, device, pad_id, epoch, optimizer=None, scaler=None):
-    total_loss = 0.0
-    total_correct = 0
-    total_tokens = 0
+            ep_loss += loss
+            ep_n += 1
+            smooth = loss if smooth is None else 0.98 * smooth + 0.02 * loss
+            global_step += 1
 
-    mode = "Train" if optimizer is not None else "Valid"
-    lr = optimizer.param_groups[0]["lr"] if optimizer is not None else 0.0
+            if args.eval_every and (s + 1) % args.eval_every == 0:
+                last_val = estimate_loss(model, {"val": val_ids}, block, args.batch_size,
+                                         args.eval_iters, rng)["val"]
 
-    pbar = tqdm(data_loader, desc=f"[{mode} {epoch+1:02d}]", dynamic_ncols=True)
-    for batch in pbar:
-        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            print_progress(epoch, n_epochs, s + 1, steps_per_epoch, smooth, last_val,
+                           opt.lr, gnorm, time.time() - t0, global_step, total_steps)
 
-        if optimizer is not None:
-            with torch.amp.autocast(device_type="cuda"):
-                outputs = model(**batch)
-                loss = outputs["loss"].mean()
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-        else:
-            with torch.no_grad():
-                outputs = model(**batch)
-                loss = outputs["loss"]
+        print()
+        train_loss = ep_loss / max(1, ep_n)
+        val_loss = estimate_loss(model, splits, block, args.batch_size, args.eval_iters, rng)["val"]
+        print(f"[epoch {epoch}] train {train_loss:.4f} | val {val_loss:.4f} "
+              f"| 用时 {time.time() - t0:.0f}s")
 
-        total_loss += loss.item()
-        mask = batch["labels"] != pad_id
-        correct = ((outputs["logits"].argmax(dim=-1) == batch["labels"]) & mask).sum().item()
-        total_correct += correct
-        total_tokens += mask.sum().item()
-        avg_acc = total_correct / total_tokens if total_tokens > 0 else 0.0
-        
-        gpu_stats = get_gpu_stats()
-        postfix = {"loss": f"{loss.item():.6f}", "acc": f"{avg_acc:.6f}", "lr": f"{lr:.6f}"}
-        if gpu_stats:
-            postfix["gpu"] = gpu_stats
-        pbar.set_postfix(postfix)
+        try:
+            tok.save(os.path.join(args.model_dir, "tokenizer.json"))
+        except Exception as e:
+            print(f"[warn] 分词器保存失败: {e}")
 
-    avg_loss = total_loss / len(data_loader)
-    avg_acc  = total_correct / total_tokens if total_tokens > 0 else 0.0
-    return avg_loss, avg_acc
+        meta = {
+            "itos": tok.itos,
+            "tokenizer": tok.meta(),
+            "epoch": epoch,
+            "step": global_step,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "steps_per_epoch": steps_per_epoch,
+            "n_chars": len(corpus),
+            "n_dialogs": len(dialogs),
+            "n_turns": n_turns,
+            "data_format": "jsonl-chat",
+            "source_files": len(files),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        path = save_checkpoint(args.model_dir, f"ckpt_epoch_{epoch:04d}.npz", model, opt, meta)
+        save_checkpoint(args.model_dir, "model.npz", model, opt, meta)
+        print(f"[save] {os.path.basename(path)}（同时更新 model.npz）")
 
-# ================================================
+        print("[sample] " + generate_sample(model, tok, sample_prompt(), rng, max_new=100)
+              .replace("\n", " ")[:200])
+        print("-" * 60)
 
-def stage_train(stages, config, data_dir="./data"):
-    print(f"\n========== Tokenizer ==========\n")
-    tokenizer = ChatTokenizer(config)
-    tokenizer.build_split_tokens(stages)
-    pad_id = tokenizer.get_split_tokens()["<|padding|>"]
-    
-    os.makedirs("./model", exist_ok=True)
-    with open("./model/tokenizer.json", "w", encoding="utf-8") as f:
-        json.dump(tokenizer.get_split_tokens(), f, indent=4, ensure_ascii=False)
-    print(f"Saved tokenizer to ./model/tokenizer.json")
-    print(f"Vocabulary size: {len(tokenizer.get_split_tokens())}\n")
+    print(f"[done] 完成，用时 {(time.time() - t0) / 60:.1f} 分钟；模型目录: {args.model_dir}")
+    print(f"[done] 对话: python chat.py --model-dir \"{args.model_dir}\"")
 
-    model = ChatModel(config)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    print(f"\n========== Device Information ==========\n")
-    if torch.cuda.is_available():
-        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
-        print(f"CUDA Version: {torch.version.cuda}")
-        print(f"GPU Compute Capability: {torch.cuda.get_device_capability(0)[0]}.{torch.cuda.get_device_capability(0)[1]}")
-        print(f"\nNote: GPU usage will show in 'CUDA' or 'Compute', not '3D' in task manager")
-    else:
-        print("Using CPU")
-    print(f"Device: {device}\n")
-    
-    model.to(device)
-    optimizer = AdamW8bit(model.parameters(), lr=config["learning_rate"])
-    scheduler = CustomLRScheduler(optimizer, config)
-    num_workers = min(8, os.cpu_count() or 1)
-    scaler = torch.amp.GradScaler()
-    global_epoch = 0
-
-    for stage in stages:
-        print(f"\n========== {stage['stage_name']} ==========\n")
-        dataset = ChatDataset(tokenizer, stage["file_path"], config)
-
-        indices = torch.randperm(len(dataset)).tolist()
-        split_idx = int(len(dataset) * (1 - config["split_valid"]))
-        train_dataset = Subset(dataset, indices[:split_idx])
-        val_dataset = Subset(dataset, indices[split_idx:])
-
-        train_loader = DataLoader(train_dataset, batch_size=config["batch_size"],
-            num_workers=num_workers, persistent_workers=(num_workers > 0), shuffle=True, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=config["batch_size"],
-            num_workers=num_workers, persistent_workers=(num_workers > 0), shuffle=False, pin_memory=True)
-
-        for epoch in range(stage["epochs"]):
-            scheduler.step(global_epoch)
-            model.train()
-            train_loss, train_acc = run_epoch(model, train_loader, device, pad_id, global_epoch, optimizer=optimizer, scaler=scaler)
-            model.eval()
-            val_loss, val_acc = run_epoch(model, val_loader, device, pad_id, global_epoch, optimizer=None, scaler=None)
-
-            save_path = os.path.join("./model", f"{stage['stage_name']}_epoch_{global_epoch+1}")
-            os.makedirs(save_path, exist_ok=True)
-            
-            with open(os.path.join(save_path, "tokenizer.json"), "w", encoding="utf-8") as f:
-                json.dump(tokenizer.get_split_tokens(), f, indent=4, ensure_ascii=False)
-            
-            with open(os.path.join(save_path, "config.json"), "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=4, ensure_ascii=False)
-            
-            state = model.state_dict()
-            save_file(state, os.path.join(save_path, "model.safetensors"))
-            del state
-            
-            print(f"\nSaved checkpoint: {save_path}")
-            print(f"  Train Loss: {train_loss:.6f}, Train Acc: {train_acc:.6f}")
-            print(f"  Valid Loss: {val_loss:.6f}, Valid Acc: {val_acc:.6f}\n")
-
-            global_epoch += 1
-
-# ================================================
 
 if __name__ == "__main__":
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    
-    training_files = find_training_files("./data")
-    stages = [
-        {"stage_name": "Fine-tuning", "file_path": training_files[0], "epochs": 15},
-    ]
-    stage_train(stages, default_config)
+    main()

@@ -1,53 +1,17 @@
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# Model files
 model/
-dataset/
+model/.gitkeep
 data/
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-
-# Environment
+!data/.gitkeep
 .env
 .venv/
 env/
 venv/
-
-# Logs
-*.log
-logs/
-
-# Large files
 *.safetensors
 *.bin
 *.pt
 *.pth
+desktop.ini
 *.zip
-*.rar
-*.7z
-*.tar.gz
-
-# Temporary files
-temp/
-tmp/
-
-# Testing
-.pytest_cache/
-coverage/
-
-# Build
-build/
-dist/
-*.egg-info/
